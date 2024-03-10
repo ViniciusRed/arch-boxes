@@ -27,11 +27,11 @@ shfmt:
 .build:
   stage: build
   before_script:
-    - pacman -Syu --needed --noconfirm gptfdisk arch-install-scripts qemu-headless jq
+    - pacman -Syu --needed --noconfirm gptfdisk btrfs-progs dosfstools arch-install-scripts qemu-img jq
   script:
     - echo "BUILD_VERSION=$(date +%Y%m%d).$CI_JOB_ID" > build.env
     - export $(< build.env)
-    - ./build-inside-vm.sh "${BUILD_VERSION}"
+    - ./build.sh "${BUILD_VERSION}"
   after_script:
     - echo "image_size_megabytes{image=\"basic\"} $(du -m output/*basic*qcow2)" > metrics.txt
     - echo "image_size_megabytes{image=\"cloudimg\"} $(du -m output/*cloudimg*qcow2)" >> metrics.txt
@@ -78,26 +78,26 @@ test-vagrant-boxes-format:
     - vagrant box add output/Arch-Linux-x86_64-virtualbox-*.box --name archlinux-vbox
     - vagrant box add output/Arch-Linux-x86_64-libvirt-*.box --name archlinux-libvirt
 
-test-basic-qemu:
+test-basic-qemu-bios:
   stage: test
   tags:
     - fast-single-thread
   variables:
     SSHPASS: arch
   before_script:
-    - pacman -Syu --needed --noconfirm qemu-headless sshpass
+    - pacman -Syu --needed --noconfirm qemu-base sshpass
   script:
     - qemu-system-x86_64 -m 512 -net nic -net user,hostfwd=tcp::2222-:22 -drive file=$(ls output/Arch-Linux-x86_64-basic-*.qcow2),if=virtio -nographic &
     - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 sudo true; do sleep 1; done"
 
-test-cloudimg-qemu:
+test-cloudimg-qemu-bios:
   stage: test
   tags:
     - fast-single-thread
   variables:
     SSHPASS: passw0rd
   before_script:
-    - pacman -Syu --needed --noconfirm qemu-headless cdrtools sshpass
+    - pacman -Syu --needed --noconfirm qemu-base cdrtools sshpass
   script:
     - |
       cat > user-data <<EOF
@@ -125,10 +125,60 @@ test-cloudimg-qemu:
     - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 pacman -Q bat tmux tree; do sleep 1; done"
     - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 test -f /runcmd_successful ; do sleep 1; done"
 
+test-basic-qemu-uefi-x64:
+  stage: test
+  tags:
+    - fast-single-thread
+  variables:
+    SSHPASS: arch
+  before_script:
+    - pacman -Syu --needed --noconfirm qemu-base edk2-ovmf sshpass
+  script:
+    - cp /usr/share/edk2-ovmf/x64/OVMF_VARS.fd ./
+    - qemu-system-x86_64 -m 512 -net nic -net user,hostfwd=tcp::2222-:22 -drive file=$(ls output/Arch-Linux-x86_64-basic-*.qcow2),if=virtio -drive if=pflash,format=raw,unit=0,file=/usr/share/edk2-ovmf/x64/OVMF_CODE.fd,read-only=on -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd -nographic &
+    - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 sudo true; do sleep 1; done"
+
+test-cloudimg-qemu-uefi-x64:
+  stage: test
+  tags:
+    - fast-single-thread
+  variables:
+    SSHPASS: passw0rd
+  before_script:
+    - pacman -Syu --needed --noconfirm qemu-base edk2-ovmf cdrtools sshpass
+  script:
+    - |
+      cat > user-data <<EOF
+      #cloud-config
+      password: '${SSHPASS}'
+      chpasswd: { expire: False }
+      ssh_pwauth: True
+      packages:
+        - tmux
+        - tree
+      runcmd:
+        - [ echo, 'Install more packages using runcmd.' ]
+        - [ pacman, --noconfirm, -Syu, bat ]
+        - [ touch, /runcmd_successful ]
+      EOF
+    - |
+      cat > meta-data <<EOF
+      instance-id: iid-local01
+      local-hostname: cloudimg
+      EOF
+    - cat user-data meta-data
+    - genisoimage -output seed.iso -volid cidata -joliet -rock user-data meta-data
+    - cp /usr/share/edk2-ovmf/x64/OVMF_VARS.fd ./
+    - qemu-system-x86_64 -m 512 -net nic -net user,hostfwd=tcp::2222-:22 -drive file=$(ls output/Arch-Linux-x86_64-cloudimg-*.qcow2),if=virtio -drive file=seed.iso,if=virtio -drive if=pflash,format=raw,unit=0,file=/usr/share/edk2-ovmf/x64/OVMF_CODE.fd,read-only=on -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd -nographic &
+    - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 true; do sleep 1; done"
+    - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 pacman -Q bat tmux tree; do sleep 1; done"
+    - timeout 15m sh -c "while ! sshpass -e ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no arch@localhost -p 2222 test -f /runcmd_successful ; do sleep 1; done"
+
 publish:
   stage: publish
   tags:
     - secure
+    - docker
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULED_PUBLISH == "TRUE"
   before_script:
@@ -139,17 +189,17 @@ publish:
           base="$(basename "${file}")"
           curl -sSf --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "${file}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/images/v${BUILD_VERSION}/${base}"
       done
-    - vagrant cloud auth login --token "${VAGRANT_API_TOKEN}"
     - vagrant cloud auth login --check
     - vagrant cloud box show archlinux/archlinux
-    - vagrant cloud publish archlinux/archlinux "${BUILD_VERSION}" libvirt output/Arch-Linux-x86_64-libvirt-*.box --release -f
-    - vagrant cloud publish archlinux/archlinux "${BUILD_VERSION}" virtualbox output/Arch-Linux-x86_64-virtualbox-*.box --release -f
+    - vagrant cloud publish archlinux/archlinux "${BUILD_VERSION}" libvirt output/Arch-Linux-x86_64-libvirt-*.box --release --no-direct-upload -f
+    - vagrant cloud publish archlinux/archlinux "${BUILD_VERSION}" virtualbox output/Arch-Linux-x86_64-virtualbox-*.box --release --no-direct-upload -f
 
 cleanup:
   stage: cleanup
   needs: []
   tags:
     - secure
+    - docker
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CLEANUP_PACKAGE_REGISTRY == "TRUE"
   before_script:

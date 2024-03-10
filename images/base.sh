@@ -7,12 +7,11 @@ function pre() {
   # https://gitlab.archlinux.org/archlinux/arch-boxes/-/issues/117
   rm "${MOUNT}/etc/machine-id"
 
+  # Swap
   arch-chroot "${MOUNT}" /usr/bin/btrfs subvolume create /swap
   chattr +C "${MOUNT}/swap"
   chmod 0700 "${MOUNT}/swap"
-  fallocate -l 512M "${MOUNT}/swap/swapfile"
-  chmod 0600 "${MOUNT}/swap/swapfile"
-  mkswap "${MOUNT}/swap/swapfile"
+  arch-chroot "${MOUNT}" /usr/bin/btrfs filesystem mkswapfile --size 512m --uuid clear /swap/swapfile
   echo -e "/swap/swapfile none swap defaults 0 0" >>"${MOUNT}/etc/fstab"
 
   arch-chroot "${MOUNT}" /usr/bin/systemd-firstboot --locale=C.UTF-8 --timezone=UTC --hostname=archlinux --keymap=us
@@ -56,6 +55,7 @@ EOF
 
   # GRUB
   arch-chroot "${MOUNT}" /usr/bin/grub-install --target=i386-pc "${LOOPDEV}"
+  arch-chroot "${MOUNT}" /usr/bin/grub-install --target=x86_64-efi --efi-directory=/efi --removable
   sed -i 's/^GRUB_TIMEOUT=.*$/GRUB_TIMEOUT=1/' "${MOUNT}/etc/default/grub"
   # setup unpredictable kernel names
   sed -i 's/^GRUB_CMDLINE_LINUX=.*$/GRUB_CMDLINE_LINUX="net.ifnames=0"/' "${MOUNT}/etc/default/grub"
